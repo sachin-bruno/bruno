@@ -26,37 +26,51 @@ describe('createBatchSender', () => {
     expect(send).toHaveBeenCalledWith(['payments']);
   });
 
-  it('holds collections found within 250 ms of a send for one batch', () => {
+  it('holds collections found within 50 ms of a send for one batch while the first 4 batches go out', () => {
     batches.add('payments');
-    advanceTo(100);
+    advanceTo(20);
     batches.add('orders');
-    advanceTo(200);
+    advanceTo(40);
     batches.add('billing');
-    advanceTo(249);
+    advanceTo(49);
 
     expect(send.mock.calls).toEqual([[['payments']]]);
 
-    advanceTo(250);
+    advanceTo(50);
 
     expect(send.mock.calls).toEqual([[['payments']], [['orders', 'billing']]]);
   });
 
-  it('never holds a collection for more than 250 ms', () => {
-    const addedAt = new Map();
-    const waits = [];
-    send.mockImplementation((collections) => {
-      collections.forEach((collection) => waits.push(Date.now() - addedAt.get(collection)));
-    });
+  it('sends the first 4 batches 50 ms apart and every later batch 250 ms apart', () => {
+    const sentAt = [];
+    send.mockImplementation(() => sentAt.push(Date.now()));
+    const found = [];
+
+    for (let time = 0; time <= 1000; time += 10) {
+      advanceTo(time);
+      found.push(time);
+      batches.add(time);
+    }
+    advanceTo(1150);
+
+    expect(sentAt).toEqual([0, 50, 100, 150, 400, 650, 900, 1150]);
+    expect(send.mock.calls.flatMap(([collections]) => collections)).toEqual(found);
+  });
+
+  it('never holds a collection for more than 50 ms in the first 4 batches, or 250 ms in later ones', () => {
+    const sentAt = [];
+    send.mockImplementation(() => sentAt.push(Date.now()));
 
     [0, 10, 240, 260, 600, 601, 1000].forEach((time) => {
       advanceTo(time);
-      addedAt.set(time, time);
       batches.add(time);
     });
     advanceTo(1250);
 
+    const waits = send.mock.calls.flatMap(([collections], index) =>
+      collections.map((foundAt) => ({ wait: sentAt[index] - foundAt, limit: index < 4 ? 50 : 250 })));
     expect(waits).toHaveLength(7);
-    expect(Math.max(...waits)).toBeLessThanOrEqual(250);
+    waits.forEach(({ wait, limit }) => expect(wait).toBeLessThanOrEqual(limit));
   });
 
   it('sends what is left on flush and drops the timed send', () => {
@@ -66,11 +80,11 @@ describe('createBatchSender', () => {
     expect(send.mock.calls).toEqual([[['payments']]]);
 
     batches.add('orders');
-    advanceTo(249);
+    advanceTo(49);
 
     expect(send.mock.calls).toEqual([[['payments']]]);
 
-    advanceTo(250);
+    advanceTo(50);
 
     expect(send.mock.calls).toEqual([[['payments']], [['orders']]]);
   });

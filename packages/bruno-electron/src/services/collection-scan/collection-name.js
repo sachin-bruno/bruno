@@ -34,11 +34,19 @@ const nameFromBrunoJson = (text) => {
   }
 };
 
-const readCollectionName = async (collectionPath) => {
-  const ymlText = await readFileStart(path.join(collectionPath, 'opencollection.yml'), NAME_BYTES);
+const readListedManifest = async (collectionPath, manifestName, entries) => {
+  if (!entries.some((entry) => entry.name.toLowerCase() === manifestName)) {
+    return '';
+  }
+  const isListedAsFile = entries.some((entry) => entry.name === manifestName && entry.isFile());
+  return readFileStart(path.join(collectionPath, manifestName), NAME_BYTES, isListedAsFile);
+};
+
+const readCollectionName = async (collectionPath, entries) => {
+  const ymlText = await readListedManifest(collectionPath, 'opencollection.yml', entries);
   const name = ymlText
     ? nameFromOpenCollectionYml(ymlText.replace(/\r\n?/g, '\n'))
-    : nameFromBrunoJson(await readFileStart(path.join(collectionPath, 'bruno.json'), NAME_BYTES));
+    : nameFromBrunoJson(await readListedManifest(collectionPath, 'bruno.json', entries));
   return name || path.basename(collectionPath);
 };
 

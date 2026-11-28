@@ -5,7 +5,7 @@ import { IconFolder, IconSearch, IconX } from '@tabler/icons';
 import ActionIcon from 'ui/ActionIcon';
 import Button from 'ui/Button';
 import Checkbox from 'ui/Checkbox';
-import { toPathKey } from 'providers/ReduxStore/slices/open-collection-modal/collection-paths';
+import { toPathKey, toRowPathKey } from 'providers/ReduxStore/slices/open-collection-modal/collection-paths';
 import { countOf } from 'providers/ReduxStore/slices/open-collection-modal/folder-results';
 import NoMatch from '../NoMatch';
 import CollectionListRow from './CollectionListRow';
@@ -64,26 +64,40 @@ const CollectionList = ({
   const rowsElement = useRef(null);
   const rangeAnchorKey = useRef(null);
 
-  const isOpen = (collection) => openPathKeys.has(toPathKey(collection.path));
-  const isHidden = useCallback((collection) => hiddenPathKeys.has(toPathKey(collection.path)), [hiddenPathKeys]);
+  const isOpen = useCallback(
+    (collection) => openPathKeys.size > 0 && openPathKeys.has(toRowPathKey(collection)),
+    [openPathKeys]
+  );
+  const isHidden = useCallback((collection) => hiddenPathKeys.has(toRowPathKey(collection)), [hiddenPathKeys]);
   const query = searchText.trim().toLowerCase();
 
   const matches = useMemo(
     () => (query ? collections.filter((collection) => matchesSearch(collection, query)) : collections),
     [collections, query]
   );
-  const hiddenCount = matches.filter(isHidden).length;
+  const hiddenCount = useMemo(
+    () => (hiddenPathKeys.size > 0 ? matches.filter(isHidden).length : 0),
+    [matches, hiddenPathKeys, isHidden]
+  );
   const rows = useMemo(
-    () => (showHidden ? matches : matches.filter((collection) => !isHidden(collection))),
-    [matches, showHidden, isHidden]
+    () => (showHidden || hiddenCount === 0 ? matches : matches.filter((collection) => !isHidden(collection))),
+    [matches, showHidden, hiddenCount, isHidden]
   );
   const hasNoMatch = query !== '' && rows.length === 0;
 
-  const selectedPaths = collections
-    .filter((collection) => selectedKeys.has(toPathKey(collection.path)) && !isOpen(collection))
-    .map((collection) => collection.path);
+  const selectedPaths = useMemo(() => {
+    if (selectedKeys.size === 0) {
+      return [];
+    }
+    return collections
+      .filter((collection) => selectedKeys.has(toRowPathKey(collection)) && !isOpen(collection))
+      .map((collection) => collection.path);
+  }, [collections, selectedKeys, isOpen]);
 
-  const selectableRowKeys = rows.filter((row) => !isOpen(row)).map((row) => toPathKey(row.path));
+  const selectableRowKeys = useMemo(
+    () => (showSelectAll ? rows.filter((row) => !isOpen(row)).map(toRowPathKey) : []),
+    [showSelectAll, rows, isOpen]
+  );
   const selectedRowCount = selectableRowKeys.filter((key) => selectedKeys.has(key)).length;
   const areAllRowsSelected = selectableRowKeys.length > 0 && selectedRowCount === selectableRowKeys.length;
 
@@ -94,8 +108,8 @@ const CollectionList = ({
   }, []);
 
   const toggleRow = (collection, event) => {
-    const key = toPathKey(collection.path);
-    const rowKeys = rows.map((row) => toPathKey(row.path));
+    const key = toRowPathKey(collection);
+    const rowKeys = rows.map(toRowPathKey);
     const anchorIndex = rowKeys.indexOf(rangeAnchorKey.current);
     const index = rowKeys.indexOf(key);
     rangeAnchorKey.current = key;
@@ -104,7 +118,7 @@ const CollectionList = ({
       const rangeKeys = rows
         .slice(Math.min(anchorIndex, index), Math.max(anchorIndex, index) + 1)
         .filter((row) => !isOpen(row))
-        .map((row) => toPathKey(row.path));
+        .map(toRowPathKey);
       setSelectedKeys((previous) => new Set([...previous, ...rangeKeys]));
       return;
     }
@@ -248,14 +262,14 @@ const CollectionList = ({
               </p>
             ) : null
           }}
-          computeItemKey={(_index, collection) => toPathKey(collection.path)}
+          computeItemKey={(_index, collection) => toRowPathKey(collection)}
           components={{ Scroller, Item: ListItem, EmptyPlaceholder: ListEmpty, Footer: ListFooter }}
           itemContent={(index, collection) => (
             <CollectionListRow
               collection={collection}
               meta={getMeta(collection)}
               isOpen={isOpen(collection)}
-              isSelected={selectedKeys.has(toPathKey(collection.path))}
+              isSelected={selectedKeys.has(toRowPathKey(collection))}
               isSelecting={selectedPaths.length > 0}
               rowRef={focusSearchWhenRemovedWithFocus}
               testIdPrefix={testIdPrefix}

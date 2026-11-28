@@ -6,7 +6,13 @@ import { Provider } from 'react-redux';
 import { configureStore } from '@reduxjs/toolkit';
 import { ThemeProvider } from 'providers/Theme';
 import appReducer from 'providers/ReduxStore/slices/app';
+import { toRowPathKey } from 'providers/ReduxStore/slices/open-collection-modal/collection-paths';
 import CollectionList from './index';
+
+jest.mock('providers/ReduxStore/slices/open-collection-modal/collection-paths', () => {
+  const actual = jest.requireActual('providers/ReduxStore/slices/open-collection-modal/collection-paths');
+  return { ...actual, toRowPathKey: jest.fn(actual.toRowPathKey) };
+});
 
 const collections = [
   { path: '/Users/me/work/payments', name: 'payments', meta: 'Opened 5m ago' },
@@ -501,6 +507,27 @@ describe('CollectionList', () => {
 
     expect(searchBox()).not.toHaveFocus();
     expect(searchBox()).not.toHaveAttribute('data-focus-on-show');
+  });
+
+  it('lists 5,000 collections the same with and without hidden rows and Select all, working out keys only for the rows it shows', () => {
+    const manyCollections = Array.from({ length: 5000 }, (_value, index) => ({ path: `/Users/me/work/api-${index}`, name: `API ${index}` }));
+    const listed = () => ({
+      names: rowNames(),
+      openNames: rows().filter((row) => row.classList.contains('is-open')).map((row) => within(row).getByTestId('list-row-name').textContent),
+      footer: openLine()
+    });
+    toRowPathKey.mockClear();
+
+    const { rerender } = renderList({ collections: manyCollections, openPathKeys: new Set(['/Users/me/work/api-2']) });
+    const keysWorkedOut = toRowPathKey.mock.calls.length;
+    const shown = listed();
+    rerender({ hiddenPathKeys: new Set(['/Users/me/elsewhere/api']), showSelectAll: true });
+
+    expect(shown.names.slice(0, 3)).toEqual(['API 0', 'API 1', 'API 2']);
+    expect(shown.openNames).toEqual(['API 2']);
+    expect(shown.footer).toBeNull();
+    expect(listed()).toEqual(shown);
+    expect(keysWorkedOut).toBeLessThan(manyCollections.length / 10);
   });
 
   describe('Select all', () => {

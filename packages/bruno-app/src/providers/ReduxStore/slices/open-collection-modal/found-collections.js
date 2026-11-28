@@ -1,10 +1,10 @@
-import { toPathKey } from './collection-paths';
+import { toRowPathKey } from './collection-paths';
 
 export const mergeFoundCollections = (rows, incoming) => {
   const merged = [...rows];
-  const indexByKey = new Map(merged.map((row, index) => [toPathKey(row.path), index]));
+  const indexByKey = new Map(merged.map((row, index) => [toRowPathKey(row), index]));
   for (const row of incoming) {
-    const key = toPathKey(row.path);
+    const key = toRowPathKey(row);
     if (indexByKey.has(key)) {
       merged[indexByKey.get(key)] = row;
     } else {

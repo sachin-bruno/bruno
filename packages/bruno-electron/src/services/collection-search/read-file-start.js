@@ -1,8 +1,8 @@
 const fs = require('node:fs/promises');
 
-const readFileStart = async (filePath, byteCount) => {
+const readFileStart = async (filePath, byteCount, knownToBeFile = false) => {
   try {
-    if (!(await fs.stat(filePath)).isFile()) {
+    if (!knownToBeFile && !(await fs.stat(filePath)).isFile()) {
       return '';
     }
     const file = await fs.open(filePath, 'r');

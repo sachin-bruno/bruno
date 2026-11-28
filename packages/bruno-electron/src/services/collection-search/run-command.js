@@ -3,9 +3,13 @@ const path = require('node:path');
 
 const runCommand = (file, args, timeout, env) =>
   new Promise((resolve) => {
-    execFile(file, args, { timeout, windowsHide: true, env }, (error, stdout) => {
+    const child = execFile(file, args, { timeout, windowsHide: true, env }, (error, stdout) => {
       resolve(error ? null : String(stdout));
     });
+    if (child.stdin) {
+      child.stdin.on('error', () => {});
+      child.stdin.end();
+    }
   });
 
 const getPowerShellPath = (env) =>

@@ -5,6 +5,7 @@ const { isRealFolder } = require('../collection-search/entry-kind');
 const { readMountTable, skippedMountPointsOf } = require('../collection-search/mount-points');
 const { findCloudFolders, isDatalessFile, findCloudOnlyFiles } = require('./cloud-folders');
 const { readCollectionName } = require('./collection-name');
+const { createFolderQueue } = require('./folder-queue');
 const { planWholeComputer } = require('./whole-computer');
 
 const MAX_FOLDER_DEPTH = 32;
@@ -13,6 +14,15 @@ const RECENTS_CONCURRENCY = 4;
 const CLOUD_CHECK_BATCH_SIZE = 25;
 const RECENTS_LOCATION_ID = 'recents';
 const WHOLE_COMPUTER_KINDS = new Set(['home', 'computer']);
+const PACKAGE_FOLDER_NAMES = new Set(['site-packages', 'steamapps']);
+const HOME_PACKAGE_FOLDERS = [
+  ['go', 'pkg', 'mod'],
+  ['anaconda3', 'pkgs'],
+  ['miniconda3', 'pkgs'],
+  ['miniforge3', 'pkgs'],
+  ['scoop', 'apps'],
+  ['scoop', 'cache']
+];
 
 const DRIVE_ROOT = /^[A-Za-z]:\\$/;
 
@@ -40,6 +50,8 @@ const withTrailingSeparator = (folderPath) => (folderPath.endsWith(path.sep) ? f
 const isComputerLocation = (location) => location.kind === 'computer';
 
 const isWholeComputerLocation = (location) => WHOLE_COMPUTER_KINDS.has(location.kind);
+
+const isPackageFolderName = (name, platform) => PACKAGE_FOLDER_NAMES.has(platform === 'win32' ? name.toLowerCase() : name);
 
 const isCollectionManifest = (entry) => hasCollectionConfig([entry]);
 
@@ -90,9 +102,9 @@ const scanLocations = async ({
 }) => {
   const searchesComputer = locations.some(isComputerLocation);
   // On Windows the mount table only feeds the whole computer plan, and reading it starts PowerShell.
-  const needsMountTable = platform !== 'win32' || searchesComputer;
+  const driveTable = platform === 'win32' && searchesComputer ? readMountTable({ platform, env, detectUsb: true }) : null;
   const [mounts, cloudFolders] = await Promise.all([
-    needsMountTable ? readMountTable({ platform, env, detectUsb: searchesComputer }) : [],
+    platform === 'win32' ? [] : readMountTable({ platform, env, detectUsb: searchesComputer }),
     findCloudFolders({ platform, homePath, env })
   ]);
   const chooseFolderSkippedMountPoints = skippedMountPointsOf(mounts, platform);
@@ -111,22 +123,26 @@ const scanLocations = async ({
   const isInsideSyncFolder = (key) => syncFolderKeyList.some((syncKey) => isSameOrInside(syncKey, key));
   const isInsidePlaceholderFolder = (filePath) => placeholderFolderKeys.some((folderKey) => isSameOrInside(folderKey, toPathKey(filePath)));
   const cloudKnownFolders = knownFolders.filter((_folderPath, index) => knownFolderKeys[index] && isInsideSyncFolder(knownFolderKeys[index]));
-  const planMounts = platform === 'win32' && !searchesComputer ? toDriveRootMounts(locations) : mounts;
+  const planMounts = platform === 'win32' ? toDriveRootMounts(searchesComputer ? locations.filter(isComputerLocation) : locations) : mounts;
   const plan = planWholeComputer({ platform, mounts: planMounts, env });
   const planPruneKeys = plan.prunePaths.map(toResolvedPathKey);
   const isInsidePlanPrune = (rootPath) => planPruneKeys.some((pruneKey) => isSameOrInside(pruneKey, toResolvedPathKey(rootPath)));
   const prunedKeys = new Set(searchesComputer ? [...planPruneKeys, ...plan.mountPrunePaths.map(toResolvedPathKey)] : planPruneKeys);
+  HOME_PACKAGE_FOLDERS.forEach((segments) => prunedKeys.add(toResolvedPathKey(path.join(homePath, ...segments))));
   const planRoots = searchesComputer
     ? [...plan.roots, ...plan.volumeRoots, ...cloudKnownFolders]
     : [...plan.roots.filter(isInsidePlanPrune), ...cloudKnownFolders];
-  const roots = toRoots({ locations, planRoots });
+  const isLaterDriveRoot = (root) =>
+    DRIVE_ROOT.test(root.path) && toResolvedPathKey(root.path) !== toResolvedPathKey(locations.find(isComputerLocation).path);
+  const allRoots = toRoots({ locations, planRoots });
+  const roots = driveTable ? allRoots.filter((root) => !isLaterDriveRoot(root)) : allRoots;
   const listedLocations = locations.filter((location) => !isWholeComputerLocation(location));
   const creditOf = (folderPath, fallbackLocationId) => innermostLocationOf(listedLocations, folderPath)?.id ?? fallbackLocationId;
   const rootKeys = new Set(roots.map((root) => toResolvedPathKey(root.path)));
   const walkedRootKeys = new Set();
   const statuses = new Map();
   const emitted = new Map();
-  const jobs = [];
+  const folderQueue = createFolderQueue();
   const pendingCloudChecks = [];
   const cloudChecks = [];
   let cloudCheckError = null;
@@ -136,7 +152,7 @@ const scanLocations = async ({
   const isExcluded = (key) => excludedKeys.some((excludedKey) => isSameOrInside(excludedKey, key));
 
   const isSkippedFolder = (name, parentRealPath, childRealPath) => {
-    if (isPrunedFolderName(name, parentRealPath) || skippedMountPoints.has(childRealPath)) {
+    if (isPrunedFolderName(name, parentRealPath) || isPackageFolderName(name, platform) || skippedMountPoints.has(childRealPath)) {
       return true;
     }
     const childKey = toPathKey(childRealPath);
@@ -171,11 +187,12 @@ const scanLocations = async ({
       return;
     }
     walkedRootKeys.add(realKey);
-    jobs.push({ folderPath: rootPath, realPath, isRoot: true, depth: toFolderDepth(realPath), locationId, reportsStatus });
+    const queueFolder = folderQueue.addRoot();
+    queueFolder({ folderPath: rootPath, realPath, isRoot: true, depth: toFolderDepth(realPath), locationId, reportsStatus, queueFolder });
   };
 
-  const report = async ({ row, folderPath, name }) => {
-    const [collectionName, mtime] = await Promise.all([name || readCollectionName(folderPath), readMtime(folderPath)]);
+  const report = async ({ row, folderPath, entries, name }) => {
+    const [collectionName, mtime] = await Promise.all([name || readCollectionName(folderPath, entries), readMtime(folderPath)]);
     onCollection({ path: row.path, name: collectionName, mtime, locationId: row.locationId });
   };
 
@@ -214,7 +231,7 @@ const scanLocations = async ({
     await report(found);
   };
 
-  const emitWalkedCollection = async (job, manifestNames) => {
+  const emitWalkedCollection = async (job, entries) => {
     const { folderPath, realPath, isRoot, locationId } = job;
     const key = toPathKey(realPath);
     const earlierRow = emitted.get(key);
@@ -226,11 +243,11 @@ const scanLocations = async ({
     if (!earlierRow && isRoot && (await fs.lstat(folderPath).catch(() => null))?.isSymbolicLink()) {
       row.path = realPath;
     }
-    await reportIfOnDisk({ row, folderPath, manifestPaths: manifestNames.map((name) => path.join(realPath, name)) });
+    await reportIfOnDisk({ row, folderPath, entries, manifestPaths: entries.filter(isCollectionManifest).map((entry) => path.join(realPath, entry.name)) });
   };
 
   const visitFolder = async (job) => {
-    const { folderPath, realPath, isRoot, depth, locationId } = job;
+    const { folderPath, realPath, isRoot, depth, locationId, queueFolder } = job;
     let entries;
     try {
       entries = await fs.readdir(folderPath, { withFileTypes: true });
@@ -241,7 +258,7 @@ const scanLocations = async ({
       return;
     }
     if (hasCollectionConfig(entries)) {
-      await emitWalkedCollection(job, entries.filter(isCollectionManifest).map((entry) => entry.name));
+      await emitWalkedCollection(job, entries);
       return;
     }
     if (depth >= MAX_FOLDER_DEPTH) {
@@ -254,7 +271,7 @@ const scanLocations = async ({
     const isFolder = await Promise.all(candidates.map((entry) => entry.isDirectory() || isRealFolder(entry, `${folderPrefix}${entry.name}`)));
     candidates.forEach((entry, index) => {
       if (isFolder[index]) {
-        jobs.push({ folderPath: `${folderPrefix}${entry.name}`, realPath: `${realPrefix}${entry.name}`, depth: depth + 1, locationId });
+        queueFolder({ folderPath: `${folderPrefix}${entry.name}`, realPath: `${realPrefix}${entry.name}`, depth: depth + 1, locationId, queueFolder });
       }
     });
   };
@@ -282,29 +299,49 @@ const scanLocations = async ({
     }
   };
 
+  const addDriveTable = (driveMounts) => {
+    const drivePlan = planWholeComputer({ platform, mounts: driveMounts, env });
+    drivePlan.prunePaths.forEach((prunePath) => prunedKeys.add(toResolvedPathKey(prunePath)));
+    const startedKeys = new Set(roots.map((root) => toResolvedPathKey(root.path)));
+    const driveRoots = toRoots({ locations, planRoots: [...drivePlan.roots, ...drivePlan.volumeRoots, ...cloudKnownFolders] })
+      .filter((root) => !startedKeys.has(toResolvedPathKey(root.path)));
+    driveRoots.forEach((root) => rootKeys.add(toResolvedPathKey(root.path)));
+    return driveRoots;
+  };
+
   const walk = () => new Promise((resolve, reject) => {
     let activeVisits = 0;
-    let unresolvedRoots = roots.length;
+    let unresolvedRoots = roots.length + (driveTable ? 1 : 0);
 
     const pump = () => {
-      while (activeVisits < CONCURRENCY && jobs.length > 0) {
+      while (activeVisits < CONCURRENCY && !folderQueue.isEmpty()) {
         activeVisits += 1;
-        visitFolder(jobs.pop()).then(() => {
+        visitFolder(folderQueue.take()).then(() => {
           activeVisits -= 1;
           pump();
         }, reject);
       }
-      if (unresolvedRoots === 0 && activeVisits === 0 && jobs.length === 0) {
+      if (unresolvedRoots === 0 && activeVisits === 0 && folderQueue.isEmpty()) {
         resolve();
       }
     };
 
-    roots.forEach((root) => {
+    const walkRoot = (root) => {
       startRoot(root).then(() => {
         unresolvedRoots -= 1;
         pump();
       }, reject);
-    });
+    };
+
+    roots.forEach(walkRoot);
+    if (driveTable) {
+      driveTable.then((driveMounts) => {
+        const driveRoots = addDriveTable(driveMounts);
+        unresolvedRoots += driveRoots.length - 1;
+        driveRoots.forEach(walkRoot);
+        pump();
+      }, reject);
+    }
     pump();
   });
 
@@ -333,7 +370,7 @@ const scanLocations = async ({
     }
     const row = { path: recentPath, locationId: owner ? owner.id : RECENTS_LOCATION_ID, fromRecents: true };
     emitted.set(key, row);
-    await reportIfOnDisk({ row, folderPath: recentPath, manifestPaths: manifestNames.map((manifestName) => path.join(realPath, manifestName)), name });
+    await reportIfOnDisk({ row, folderPath: recentPath, entries, manifestPaths: manifestNames.map((manifestName) => path.join(realPath, manifestName)), name });
   };
 
   const checkRecents = async () => {

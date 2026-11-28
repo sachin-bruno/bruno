@@ -6,12 +6,8 @@ const POWERSHELL_TIMEOUT = 10000;
 const MAX_ENCODED_PATHS_LENGTH = 30000;
 const CLOUD_CHECK_FILES_VARIABLE = 'BRUNO_CLOUD_CHECK_FILES';
 const ICLOUD_SYNCED_HOME_FOLDERS = ['Desktop', 'Documents'];
-
-const LIST_SYNC_ROOTS = [
-  '$roots = Get-ItemProperty -Path \'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SyncRootManager\\*\\UserSyncRoots\' -ErrorAction SilentlyContinue',
-  '| ForEach-Object { $_.PSObject.Properties | Where-Object { $_.Name -like \'S-1-*\' } | ForEach-Object { $_.Value } };',
-  '[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($roots -join [char]10)))'
-].join(' ');
+const SYNC_ROOT_MANAGER_KEY = 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SyncRootManager';
+const USER_SID = /^S-1-/i;
 
 const LIST_CLOUD_ONLY_FILES = [
   `$paths = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:${CLOUD_CHECK_FILES_VARIABLE})) -split [char]10;`,
@@ -55,18 +51,59 @@ const findMacCloudFolders = async (homePath) => {
   };
 };
 
+const readStringValues = (registry, key, valueName) => {
+  try {
+    return [].concat(registry.getValue(key, null, valueName))
+      .filter((value) => typeof value === 'string')
+      .map((value) => value.split('\0')[0]);
+  } catch (error) {
+    return [];
+  }
+};
+
+const readUserSyncRoots = (registry, managerKey, syncRootId) => {
+  let key = null;
+  try {
+    key = registry.openKey(managerKey, `${syncRootId}\\UserSyncRoots`, registry.Access.READ);
+    if (!key) {
+      return [];
+    }
+    return registry.enumValueNames(key)
+      .filter((valueName) => USER_SID.test(valueName))
+      .flatMap((valueName) => readStringValues(registry, key, valueName));
+  } catch (error) {
+    return [];
+  } finally {
+    registry.closeKey(key);
+  }
+};
+
+const readRegisteredSyncRoots = () => {
+  try {
+    const registry = require('native-reg');
+    const managerKey = registry.openKey(registry.HKEY.LOCAL_MACHINE, SYNC_ROOT_MANAGER_KEY, registry.Access.READ);
+    if (!managerKey) {
+      return [];
+    }
+    try {
+      return registry.enumKeyNames(managerKey).flatMap((syncRootId) => readUserSyncRoots(registry, managerKey, syncRootId));
+    } finally {
+      registry.closeKey(managerKey);
+    }
+  } catch (error) {
+    return [];
+  }
+};
+
 const findWindowsCloudFolders = async (homePath, env) => {
   const dropboxInfoFiles = [env.LOCALAPPDATA, env.APPDATA].filter(Boolean).map((folderPath) => path.win32.join(folderPath, 'Dropbox', 'info.json'));
-  const [syncRootsOutput, ...dropboxInfos] = await Promise.all([
-    runPowerShell(LIST_SYNC_ROOTS, env),
-    ...dropboxInfoFiles.map(readJsonFile)
-  ]);
+  const dropboxInfos = await Promise.all(dropboxInfoFiles.map(readJsonFile));
   const folders = [
     env.OneDrive,
     env.OneDriveConsumer,
     env.OneDriveCommercial,
     path.win32.join(env.USERPROFILE || homePath, 'OneDrive'),
-    ...(syncRootsOutput ? decodeLines(syncRootsOutput).filter((value) => /^[A-Za-z]:\\/.test(value)) : []),
+    ...readRegisteredSyncRoots().filter((value) => /^[A-Za-z]:\\/.test(value)),
     ...dropboxInfos.flatMap(dropboxFolders)
   ].filter(Boolean);
   const syncFolders = folders.filter((folderPath, index) => folders.findIndex((otherPath) => toFolderKey(otherPath) === toFolderKey(folderPath)) === index);

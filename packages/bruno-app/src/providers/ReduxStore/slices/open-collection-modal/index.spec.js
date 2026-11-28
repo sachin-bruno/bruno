@@ -25,6 +25,12 @@ import reducer, {
   myComputerScanFailed
 } from 'providers/ReduxStore/slices/open-collection-modal';
 import { DEFAULT_OPEN_COLLECTION_PAGE, OPEN_COLLECTION_PAGE, OPEN_COLLECTION_SUB_PAGE } from 'utils/common/constants';
+import { normalizePath } from 'utils/common/path';
+
+jest.mock('utils/common/path', () => {
+  const actual = jest.requireActual('utils/common/path');
+  return { __esModule: true, ...actual, normalizePath: jest.fn(actual.normalizePath) };
+});
 
 const initialState = reducer(undefined, { type: 'init' });
 
@@ -342,6 +348,37 @@ describe('openCollectionModal slice', () => {
       ]);
 
       expect(scanning.collections).toEqual([api, notes, orders]);
+    });
+
+    it('works out path keys only for the rows a batch adds, and keeps the earlier rows as they are', () => {
+      const [freshApi, freshOrders, freshNotes] = [api, orders, notes].map((row) => ({ ...row }));
+      const scanning = scannedModal([myComputerScanStarted('scan-1'), myComputerCollectionsFound({ scanId: 'scan-1', collections: [freshApi, freshOrders] })]);
+      normalizePath.mockClear();
+
+      const next = reducer(scanning, myComputerCollectionsFound({ scanId: 'scan-1', collections: [freshNotes] }));
+
+      expect(next.myComputer.collections).toEqual([freshApi, freshOrders, freshNotes]);
+      expect(next.myComputer.collections[0]).toBe(scanning.myComputer.collections[0]);
+      expect(normalizePath).toHaveBeenCalledTimes(1);
+    });
+
+    it('carries the rows over to a new scan without working out their path keys again', () => {
+      const scanned = scannedModal(firstScan);
+      normalizePath.mockClear();
+
+      const restarted = reducer(scanned, myComputerScanStarted('scan-2'));
+
+      expect(restarted.myComputer.previousCollections).toEqual([api, orders, notes]);
+      expect(normalizePath).not.toHaveBeenCalled();
+    });
+
+    it('keeps the same empty list of earlier rows when a first scan finishes', () => {
+      const scanning = scannedModal(firstScan.slice(0, -1));
+
+      const finished = reducer(scanning, firstScan[firstScan.length - 1]);
+
+      expect(finished.myComputer.status).toBe('done');
+      expect(finished.myComputer.previousCollections).toBe(scanning.myComputer.previousCollections);
     });
 
     it('ignores collections from a scan that is no longer the current one', () => {

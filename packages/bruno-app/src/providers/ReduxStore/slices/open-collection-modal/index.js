@@ -1,4 +1,4 @@
-import { createSlice } from '@reduxjs/toolkit';
+import { createSlice, original } from '@reduxjs/toolkit';
 import { DEFAULT_OPEN_COLLECTION_PAGE, OPEN_COLLECTION_PAGE } from 'utils/common/constants';
 import { mergeFoundCollections } from './found-collections';
 
@@ -134,7 +134,7 @@ export const openCollectionModalSlice = createSlice({
     },
     myComputerScanStarted: (state, action) => {
       const { myComputer } = state;
-      myComputer.previousCollections = mergeFoundCollections(myComputer.previousCollections, myComputer.collections);
+      myComputer.previousCollections = mergeFoundCollections(original(myComputer.previousCollections), original(myComputer.collections));
       myComputer.collections = [];
       myComputer.status = 'scanning';
       myComputer.scanId = action.payload;
@@ -147,7 +147,7 @@ export const openCollectionModalSlice = createSlice({
       }
       const locationIds = new Set(action.payload.locations.map((location) => location.id));
       const removedIds = new Set((myComputer.locations || []).map((location) => location.id).filter((id) => !locationIds.has(id)));
-      myComputer.previousCollections = myComputer.previousCollections.filter((collection) => !removedIds.has(collection.locationId));
+      myComputer.previousCollections = original(myComputer.previousCollections).filter((collection) => !removedIds.has(collection.locationId));
       myComputer.locations = action.payload.locations.map((location) => ({ ...location, status: 'scanning', found: 0 }));
     },
     myComputerCollectionsFound: (state, action) => {
@@ -155,7 +155,7 @@ export const openCollectionModalSlice = createSlice({
       if (action.payload.scanId !== myComputer.scanId) {
         return;
       }
-      myComputer.collections = mergeFoundCollections(myComputer.collections, action.payload.collections);
+      myComputer.collections = mergeFoundCollections(original(myComputer.collections), action.payload.collections);
     },
     myComputerScanFinished: (state, action) => {
       const { myComputer } = state;
@@ -169,7 +169,9 @@ export const openCollectionModalSlice = createSlice({
         return;
       }
       myComputer.status = 'done';
-      myComputer.previousCollections = [];
+      if (myComputer.previousCollections.length > 0) {
+        myComputer.previousCollections = [];
+      }
     },
     myComputerScanFailed: (state, action) => {
       const { myComputer } = state;

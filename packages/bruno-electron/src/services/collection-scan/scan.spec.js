@@ -177,6 +177,41 @@ describe('scanLocations', () => {
     expect(foundPaths(collections)).toEqual(kept.sort());
   });
 
+  it('skips Python package and Steam game folders below a location', async () => {
+    makeBruCollection('Skipped', 'work', 'lib', 'python3.12', 'site-packages', 'tool');
+    makeBruCollection('Skipped', 'work', 'SteamLibrary', 'steamapps', 'common', 'game');
+    const kept = makeBruCollection('Kept', 'work', 'api');
+
+    const { collections } = await scan({ locations: [location('work', 'work')] });
+
+    expect(foundPaths(collections)).toEqual([kept]);
+  });
+
+  it('skips a Steam game folder in any letter case on Windows', async () => {
+    makeBruCollection('Skipped', 'work', 'OldSteam', 'SteamApps', 'game');
+    const kept = makeBruCollection('Kept', 'work', 'api');
+
+    const { collections } = await scan({ locations: [location('work', 'work')], platform: 'win32' });
+
+    expect(foundPaths(collections)).toEqual([kept]);
+  });
+
+  it('skips the Go, conda and Scoop package folders in the home folder, but not folders with those names elsewhere', async () => {
+    [
+      ['go', 'pkg', 'mod', 'github.com', 'team', 'tool'],
+      ['anaconda3', 'pkgs', 'tool'],
+      ['miniconda3', 'pkgs', 'tool'],
+      ['miniforge3', 'pkgs', 'tool'],
+      ['scoop', 'apps', 'tool'],
+      ['scoop', 'cache', 'tool']
+    ].forEach((segments) => makeBruCollection('Skipped', 'user-home', ...segments));
+    const kept = [makeBruCollection('Kept', 'user-home', 'api'), makeBruCollection('Kept', 'work', 'go', 'pkg', 'mod', 'api')];
+
+    const { collections } = await scan({ locations: [location('home', 'user-home'), location('work', 'work')] });
+
+    expect(foundPaths(collections)).toEqual(kept.sort());
+  });
+
   it('searches a location even when its own name would be skipped', async () => {
     const collection = makeBruCollection('Build API', 'build', 'api');
 
@@ -220,6 +255,18 @@ describe('scanLocations', () => {
     const { collections } = await scan({ locations: [location('work', 'work')] });
 
     expect(collections).toEqual([expect.objectContaining({ path: collection, name: 'Linked manifest' })]);
+  });
+
+  it('looks up a manifest listed in another letter case by its lowercase name', async () => {
+    const collection = makeBruCollection('From json', 'work', 'api');
+    fs.writeFileSync(path.join(collection, 'OpenCollection.yml'), 'info:\n  name: From yml\n');
+    const lowercasePath = path.join(collection, 'opencollection.yml');
+    const stat = jest.spyOn(fsPromises, 'stat');
+
+    const { collections } = await scan({ locations: [location('work', 'work')] });
+
+    expect(stat).toHaveBeenCalledWith(lowercasePath);
+    expect(collections).toEqual([expect.objectContaining({ path: collection, name: fs.existsSync(lowercasePath) ? 'From yml' : 'From json' })]);
   });
 
   it('reports a location that links to a collection by its real path', async () => {
@@ -467,6 +514,14 @@ describe('scanLocations', () => {
     ]);
   });
 
+  it('names a recent that has no stored name from its manifest', async () => {
+    const recent = makeBruCollection('Manifest name', 'work', '.archive', 'api');
+
+    const { collections } = await scan({ locations: [location('work', 'work')], recents: [{ path: recent, name: null }] });
+
+    expect(collections).toEqual([{ path: recent, name: 'Manifest name', mtime: mtimeOf(recent), locationId: 'work' }]);
+  });
+
   it('leaves out recents that are gone or no longer collections', async () => {
     const recent = makeBruCollection('Manifest name', 'work', '.archive', 'api');
     const plainFolder = makeFolder('work', '.archive', 'plain-folder');
@@ -575,6 +630,41 @@ describe('scanLocations', () => {
     await scan({ locations: [location('wide', 'wide')] });
 
     expect(reads.mostInFlight).toBe(16);
+  });
+
+  it('takes turns between locations, so a big location does not hold back a small one', async () => {
+    Array.from({ length: 40 }, (_value, index) => ['left', 'right'].forEach((side) => makeFolder('big', `folder-${index}`, side, 'deeper')));
+    const smallFolders = ['one', 'two', 'three'].map((name) => makeFolder('small', name));
+    const bigLocation = location('big', 'big');
+    const requested = [];
+    const heldReads = [];
+    jest.spyOn(fsPromises, 'readdir').mockImplementation((target, options) => {
+      requested.push(target);
+      return new Promise((resolve, reject) => {
+        heldReads.push({ target, release: () => readFolder(target, options).then(resolve, reject) });
+      });
+    });
+    const releaseRead = async (read) => {
+      heldReads.splice(heldReads.indexOf(read), 1);
+      await read.release();
+      await new Promise(setImmediate);
+    };
+
+    let finished = false;
+    const scanning = scan({ locations: [bigLocation, location('small', 'small')] }).finally(() => {
+      finished = true;
+    });
+    while (heldReads.length < 2) {
+      await new Promise(setImmediate);
+    }
+    await releaseRead(heldReads.find((read) => read.target === bigLocation.path));
+    while (!finished) {
+      await (heldReads.length > 0 ? releaseRead(heldReads[0]) : new Promise(setImmediate));
+    }
+    await scanning;
+
+    const firstDeepBigRead = requested.findIndex((target) => path.basename(target) === 'deeper');
+    expect(requested.slice(0, firstDeepBigRead)).toEqual(expect.arrayContaining(smallFolders));
   });
 
   it('returns each location’s status and count in the order the locations came in', async () => {
@@ -696,6 +786,103 @@ describe('scanLocations', () => {
   });
 
   describe('the whole computer', () => {
+    describe('on Windows', () => {
+      const holdDriveTable = () => {
+        let answer;
+        readMountTable.mockReturnValue(new Promise((resolve) => {
+          answer = resolve;
+        }));
+        return (driveMounts) => answer(driveMounts);
+      };
+
+      const waitUntil = async (isDone) => {
+        for (let attempt = 0; attempt < 200 && !isDone(); attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      };
+
+      it('walks the system drive, the locations and the recents while the drive list is read, and the other drives once it arrives', async () => {
+        const systemDrive = makeFolder('C');
+        const systemApi = makeBruCollection('System API', 'C', 'api');
+        const workApi = makeBruCollection('Work API', 'work', 'api');
+        const recentApi = makeBruCollection('Recent API', 'elsewhere', 'recent');
+        const dataDrive = makeFolder('D');
+        const dataApi = makeBruCollection('Data API', 'D', 'api');
+        makeBruCollection('Skipped', 'D', 'Windows', 'api');
+        const driveMounts = [{ path: systemDrive, kind: 'local' }, { path: dataDrive, kind: 'local' }];
+        planWholeComputer.mockImplementation(({ mounts }) => (mounts === driveMounts
+          ? planOf({ roots: [systemDrive, dataDrive], prunePaths: [path.join(dataDrive, 'Windows')] })
+          : planOf({ roots: [systemDrive] })));
+        const answerDriveTable = holdDriveTable();
+        const readdir = jest.spyOn(fsPromises, 'readdir');
+        const shown = [];
+
+        const scanning = scan({
+          locations: [location('work', 'work'), computerAt('C')],
+          recents: [{ path: recentApi, name: 'Recent API' }],
+          platform: 'win32',
+          onCollection: (collection) => shown.push(collection.path)
+        });
+        await waitUntil(() => shown.length === 3);
+
+        expect([...shown].sort()).toEqual([systemApi, workApi, recentApi].sort());
+        expect(readdir.mock.calls.map(([target]) => target)).not.toContain(dataDrive);
+
+        answerDriveTable(driveMounts);
+        const { collections, statuses } = await scanning;
+
+        expect(foundPaths(collections)).toEqual([systemApi, workApi, recentApi, dataApi].sort());
+        expect(readdir.mock.calls.map(([target]) => target)).not.toContain(path.join(dataDrive, 'Windows'));
+        expect(statuses).toEqual([{ id: 'work', status: 'done', found: 1 }, { id: 'computer', status: 'done', found: 2 }]);
+      });
+
+      it('waits for the drive list before walking a location that is another whole drive', async () => {
+        const systemDrive = makeFolder('C');
+        const systemApi = makeBruCollection('System API', 'C', 'api');
+        const otherDrive = 'E:\\';
+        const manifest = { name: 'bruno.json', isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false };
+        const realpathOf = fsPromises.realpath;
+        jest.spyOn(fsPromises, 'realpath').mockImplementation((target, options) => (target === otherDrive ? Promise.resolve(target) : realpathOf(target, options)));
+        const readdir = jest.spyOn(fsPromises, 'readdir').mockImplementation((target, options) => (target === otherDrive ? Promise.resolve([manifest]) : readFolder(target, options)));
+        planWholeComputer.mockReturnValue(planOf({ roots: [systemDrive] }));
+        const answerDriveTable = holdDriveTable();
+        const shown = [];
+
+        const scanning = scan({
+          locations: [{ id: 'e-drive', path: otherDrive }, computerAt('C')],
+          platform: 'win32',
+          onCollection: (collection) => shown.push(collection.path)
+        });
+        await waitUntil(() => shown.includes(systemApi));
+
+        expect(readdir.mock.calls.map(([target]) => target)).not.toContain(otherDrive);
+
+        answerDriveTable([{ path: systemDrive, kind: 'local' }]);
+        const { collections } = await scanning;
+
+        expect(foundPaths(collections)).toEqual([systemApi, otherDrive].sort());
+      });
+
+      it('plans from the system drive root first and from the drive list once it arrives', async () => {
+        skippedMountPointsOf.mockImplementation(jest.requireActual('../collection-search/mount-points').skippedMountPointsOf);
+        const driveMounts = [{ path: 'C:\\', kind: 'local' }, { path: 'D:\\', kind: 'local' }];
+        readMountTable.mockResolvedValue(driveMounts);
+        const env = {};
+
+        const { statuses } = await scan({
+          locations: [{ id: 'work', path: 'D:\\bruno-scan-missing-work' }, { id: 'computer', path: 'C:\\', kind: 'computer' }],
+          platform: 'win32',
+          env
+        });
+
+        expect(statuses).toEqual([{ id: 'work', status: 'missing', found: 0 }, { id: 'computer', status: 'done', found: 0 }]);
+        expect(planWholeComputer.mock.calls).toEqual([
+          [{ platform: 'win32', mounts: [{ path: 'C:\\', kind: 'local' }], env }],
+          [{ platform: 'win32', mounts: driveMounts, env }]
+        ]);
+      });
+    });
+
     it('walks each of its roots and the locations inside them once, and credits each collection to the location closest to it', async () => {
       const system = makeFolder('system');
       const work = makeBruCollection('Work API', 'system', 'work', 'api');

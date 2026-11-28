@@ -9,7 +9,7 @@ import {
   scanMyComputer,
   switchToCollection
 } from 'providers/ReduxStore/slices/open-collection-modal/actions';
-import { toPathKey } from 'providers/ReduxStore/slices/open-collection-modal/collection-paths';
+import { toPathKey, toRowPathKey } from 'providers/ReduxStore/slices/open-collection-modal/collection-paths';
 import { countOf } from 'providers/ReduxStore/slices/open-collection-modal/folder-results';
 import {
   selectMyComputerCollections,
@@ -42,15 +42,22 @@ const MyComputerPage = () => {
   const openPathKeys = useMemo(() => new Set(openPathKeyList), [openPathKeyList]);
   const recentsByKey = useMemo(() => new Map(recentItems.map((item) => [toPathKey(item.path), item])), [recentItems]);
   const openLastCollections = useMemo(() => {
-    const isOpen = (collection) => openPathKeys.has(toPathKey(collection.path));
-    return [...collections.filter((collection) => !isOpen(collection)), ...collections.filter(isOpen)];
+    if (openPathKeys.size === 0) {
+      return collections;
+    }
+    const closed = [];
+    const open = [];
+    collections.forEach((collection) => {
+      (openPathKeys.has(toRowPathKey(collection)) ? open : closed).push(collection);
+    });
+    return open.length === 0 ? collections : [...closed, ...open];
   }, [collections, openPathKeys]);
 
   const showPage = (page) => dispatch(openCollectionModal(page));
   const chooseFolders = () => dispatch(openCollectionModal(OPEN_COLLECTION_PAGE.CHOOSE_FOLDER, { pickFolders: true }));
 
   const getMeta = (collection) => {
-    const recent = recentsByKey.get(toPathKey(collection.path));
+    const recent = recentsByKey.get(toRowPathKey(collection));
     if (recent) {
       return describeLastUse(recent);
     }
